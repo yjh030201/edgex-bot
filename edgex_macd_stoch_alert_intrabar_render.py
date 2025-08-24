@@ -1,26 +1,19 @@
-import os
-import time
-import requests
-import numpy as np
-import pandas as pd
-from datetime import datetime, timezone
+import os, time, requests, numpy as np, pandas as pd
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
-
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("환경변수 BOT_TOKEN / CHAT_ID 필요")
 
-SYMBOL       = "BTCUSD"
-CONTRACT_ID  = "10000001"
-TIMEFRAME    = "5m"
-POLL_SEC     = 5
+SYMBOL, CONTRACT_ID, TIMEFRAME = "BTCUSD", "10000001", "5m"
+POLL_SEC = 5
 
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
-RSI_PERIOD, RSI_FILTER            = 14, 50.0
-STOCH_RSI_PERIOD                  = 14
-STOCH_K_SMOOTH, STOCH_D_SMOOTH    = 3, 3
-K_OVERSOLD, K_OVERBOUGHT          = 20.0, 80.0
+RSI_PERIOD, RSI_FILTER = 14, 50.0
+STOCH_RSI_PERIOD, STOCH_K_SMOOTH, STOCH_D_SMOOTH = 14, 3, 3
+K_OVERSOLD, K_OVERBOUGHT = 20.0, 80.0
 
 HTTP_BASE = "https://pro.edgex.exchange"
 TF_MAP = {
@@ -48,104 +41,88 @@ def fetch_kline(contract_id:str, kline_type:str, size:int=400) -> pd.DataFrame:
         if not rows: return pd.DataFrame()
         df = pd.DataFrame(rows)
         for col in ["open","high","low","close","size","klineTime"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.sort_values("klineTime").reset_index(drop=True)
-        return pd.DataFrame({
-            "timestamp": df["klineTime"],
-            "open": df["open"], "high": df["high"], "low": df["low"],
-            "close": df["close"], "volume": df["size"]
-        })
+        return pd.DataFrame({"timestamp": df["klineTime"],"open": df["open"],"high": df["high"],
+                             "low": df["low"],"close": df["close"],"volume": df["size"]})
     except Exception as e:
-        print("fetch_kline 오류:", e)
-        return pd.DataFrame()
+        print("fetch_kline 오류:", e); return pd.DataFrame()
 
-def ema(s: pd.Series, span:int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
+def ema(s: pd.Series, span:int) -> pd.Series: return s.ewm(span=span, adjust=False).mean()
 
 def rsi(s: pd.Series, period:int=14) -> pd.Series:
-    d   = s.diff()
-    up  = d.where(d>0, 0.0)
-    dn  = (-d).where(d<0, 0.0)
-    avg_up = up.rolling(period).mean()
-    avg_dn = dn.rolling(period).mean()
-    rs  = avg_up / avg_dn.replace(0, np.nan)
-    out = 100 - (100 / (1 + rs))
+    d=s.diff(); up=d.where(d>0,0.0); dn=(-d).where(d<0,0.0)
+    ag=up.rolling(period).mean(); al=dn.rolling(period).mean()
+    rs=ag/al.replace(0,np.nan); out=100-(100/(1+rs))
     return out.ffill().fillna(50.0)
 
 def macd(s: pd.Series, fast:int, slow:int, signal:int):
-    m  = ema(s, fast) - ema(s, slow)
-    sg = ema(m, signal)
-    return m, sg, (m - sg)
+    m=ema(s,fast)-ema(s,slow); sg=ema(m,signal); return m, sg, (m-sg)
 
 def stoch_rsi_from_rsi(rsi_s: pd.Series, period:int, k_s:int, d_s:int):
-    min_r = rsi_s.rolling(period).min()
-    max_r = rsi_s.rolling(period).max()
-    denom = (max_r - min_r).replace(0, np.nan)
-    stoch = ((rsi_s - min_r) / denom) * 100.0
-    k = stoch.rolling(k_s).mean().ffill().fillna(50.0)
-    d = k.rolling(d_s).mean().ffill().fillna(50.0)
-    return k, d
+    mn=rsi_s.rolling(period).min(); mx=rsi_s.rolling(period).max()
+    st=((rsi_s-mn)/(mx-mn).replace(0,np.nan))*100.0
+    k=st.rolling(k_s).mean().ffill().fillna(50.0); d=k.rolling(d_s).mean().ffill().fillna(50.0)
+    return k,d
 
 def check_signal(df: pd.DataFrame):
-    if df.empty or len(df) < max(MACD_SLOW, RSI_PERIOD) + 5:
-        return None, None
-    close = df["close"]
-    rsi14 = rsi(close, RSI_PERIOD)
-    macd_line, sig_line, _ = macd(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-    k, d = stoch_rsi_from_rsi(rsi14, STOCH_RSI_PERIOD, STOCH_K_SMOOTH, STOCH_D_SMOOTH)
-
-    di = df.copy()
-    di["rsi"] = rsi14; di["macd"] = macd_line; di["sig"] = sig_line
-    di["k"] = k; di["d"] = d
-
-    prev = di.iloc[-2]
-    curr = di.iloc[-1]
-
-    macd_up   = (prev["macd"] <= prev["sig"]) and (curr["macd"] >  curr["sig"])
-    macd_down = (prev["macd"] >= prev["sig"]) and (curr["macd"] <  curr["sig"])
-    k_up      = (prev["k"]   <= prev["d"])    and (curr["k"]   >   curr["d"])
-    k_down    = (prev["k"]   >= prev["d"])    and (curr["k"]   <   curr["d"])
-    from_os   = (prev["k"] < K_OVERSOLD)
-    from_ob   = (prev["k"] > K_OVERBOUGHT)
-
-    long_ok  = macd_up   and k_up   and from_os and (curr["rsi"] >= RSI_FILTER)
-    short_ok = macd_down and k_down and from_ob and (curr["rsi"] <= RSI_FILTER)
-
-    info = {
-        "ts": int(curr["timestamp"]),
-        "px": float(curr["close"]),
-        "macd": float(curr["macd"]), "sig": float(curr["sig"]),
-        "k": float(curr["k"]), "d": float(curr["d"]),
-        "rsi": float(curr["rsi"])
-    }
-
+    if df.empty or len(df) < max(MACD_SLOW, RSI_PERIOD) + 5: return None, None
+    close=df["close"]; rsi14=rsi(close,RSI_PERIOD)
+    macd_line,sig_line,_=macd(close,MACD_FAST,MACD_SLOW,MACD_SIGNAL)
+    k,d=stoch_rsi_from_rsi(rsi14,STOCH_RSI_PERIOD,STOCH_K_SMOOTH,STOCH_D_SMOOTH)
+    di=df.copy(); di["rsi"]=rsi14; di["macd"]=macd_line; di["sig"]=sig_line; di["k"]=k; di["d"]=d
+    prev, curr = di.iloc[-2], di.iloc[-1]
+    macd_up   = (prev["macd"]<=prev["sig"]) and (curr["macd"]> curr["sig"])
+    macd_down = (prev["macd"]>=prev["sig"]) and (curr["macd"]< curr["sig"])
+    k_up      = (prev["k"]  <=prev["d"])    and (curr["k"]  >  curr["d"])
+    k_down    = (prev["k"]  >=prev["d"])    and (curr["k"]  <  curr["d"])
+    from_os   = (prev["k"]<K_OVERSOLD); from_ob=(prev["k"]>K_OVERBOUGHT)
+    long_ok  = macd_up and k_up and from_os and (curr["rsi"]>=RSI_FILTER)
+    short_ok = macd_down and k_down and from_ob and (curr["rsi"]<=RSI_FILTER)
+    info={"ts":int(curr["timestamp"]),"px":float(curr["close"]),
+          "macd":float(curr["macd"]), "sig":float(curr["sig"]),
+          "k":float(curr["k"]), "d":float(curr["d"]), "rsi":float(curr["rsi"])}
     if long_ok:  return "LONG", info
     if short_ok: return "SHORT", info
     return None, info
 
+def next_9am_kst_utc_ts(now_utc: datetime | None = None) -> float:
+    tz = ZoneInfo("Asia/Seoul")
+    now_kst = (now_utc or datetime.now(timezone.utc)).astimezone(tz)
+    target = now_kst.replace(hour=9, minute=0, second=0, microsecond=0)
+    if now_kst >= target:
+        target += timedelta(days=1)
+    return target.astimezone(timezone.utc).timestamp()
+
 def main():
     kline_type = TF_MAP[TIMEFRAME]
-    tg_send("Render Worker 시작 ✅")
-    last_alerted_candle = set()
+    tg_send("정상작동 ✅")  # 시작 시 1회 즉시 발송
+    last_alerted_candle=set()
+    next_tg_hb = next_9am_kst_utc_ts()
+
     while True:
         df = fetch_kline(CONTRACT_ID, kline_type, size=400)
-        if df.empty:
-            time.sleep(POLL_SEC); continue
-        signal, info = check_signal(df)
-        if signal and info and info["ts"] not in last_alerted_candle:
-            side = "롱" if signal == "LONG" else "숏"
-            msg = (f"[{side} 신호] {SYMBOL} {TIMEFRAME}\n"
-                   f"- 가격: {info['px']}\n"
-                   f"- MACD: {info['macd']:.4f} vs {info['sig']:.4f}\n"
-                   f"- StochRSI K/D: {info['k']:.1f}/{info['d']:.1f}\n"
-                   f"- RSI(14): {info['rsi']:.1f}\n"
-                   f"- 시간: {ts_local(info['ts'])}")
-            print("[ALERT]", msg.replace("\n", " | "))
-            tg_send(msg)
-            last_alerted_candle.add(info["ts"])
+        if not df.empty:
+            signal, info = check_signal(df)
+            if signal and info and info["ts"] not in last_alerted_candle:
+                side = "롱" if signal=="LONG" else "숏"
+                msg=(f"[{side} 신호] {SYMBOL} {TIMEFRAME}\n"
+                     f"- 가격: {info['px']}\n"
+                     f"- MACD: {info['macd']:.4f} vs {info['sig']:.4f}\n"
+                     f"- StochRSI K/D: {info['k']:.1f}/{info['d']:.1f}\n"
+                     f"- RSI(14): {info['rsi']:.1f}\n"
+                     f"- 시간: {ts_local(info['ts'])}")
+                print("[ALERT]", msg.replace("\n"," | ")); tg_send(msg)
+                last_alerted_candle.add(info["ts"])
+
+        # 매일 KST 09:00 하트비트
+        if time.time() >= next_tg_hb:
+            tg_send("정상작동 ✅")
+            next_tg_hb = next_9am_kst_utc_ts()
+
         time.sleep(POLL_SEC)
 
 if __name__ == "__main__":
     main()
+
 

@@ -126,6 +126,7 @@ def check_signal(df: pd.DataFrame):
 
 def main():
     kline_type = TF_MAP[TIMEFRAME]
+    tg_send("Render Worker 시작 ✅")
     last_alerted_candle = set()
     while True:
         df = fetch_kline(CONTRACT_ID, kline_type, size=400)
@@ -147,3 +148,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
